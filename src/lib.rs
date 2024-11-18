@@ -301,6 +301,57 @@ impl<'a> Decompressor<'a> {
 
         decoded
     }
+
+    pub fn decompress_into(&self, compressed: &[u8], buffer: &mut Vec<u8>) {
+        let ptr = buffer.as_mut_ptr();
+
+        let mut in_pos = 0;
+        let mut out_pos = 0;
+
+        while in_pos < compressed.len() {
+            // out_pos can grow at most 8 bytes per iteration, and we start at 0
+            debug_assert!(out_pos <= buffer.capacity() - size_of::<Symbol>());
+            // SAFETY: in_pos is always in range 0..compressed.len()
+            let code = unsafe { *compressed.get_unchecked(in_pos) };
+            if code == ESCAPE_CODE {
+                // Advance by one, do raw write.
+                in_pos += 1;
+                // SAFETY: out_pos is always 8 bytes or more from the end of decoded buffer
+                // SAFETY: ESCAPE_CODE can not be the last byte of the compressed stream
+                unsafe {
+                    let write_addr = ptr.byte_add(out_pos);
+                    std::ptr::write(write_addr, *compressed.get_unchecked(in_pos));
+                }
+                out_pos += 1;
+                in_pos += 1;
+            } else {
+                // SAFETY: code is in range 0..255
+                // The symbol and length tables are both of length 256, so this is safe.
+                let symbol = unsafe { *self.symbols.get_unchecked(code as usize) };
+                let length = unsafe { *self.lengths.get_unchecked(code as usize) };
+                // SAFETY: out_pos is always 8 bytes or more from the end of decoded buffer
+                unsafe {
+                    let write_addr = ptr.byte_add(out_pos) as *mut u64;
+                    // Perform 8 byte unaligned write.
+                    write_addr.write_unaligned(symbol.as_u64());
+                }
+                in_pos += 1;
+                out_pos += length as usize;
+            }
+        }
+
+        assert!(
+            in_pos >= compressed.len(),
+            "decompression should exhaust input before output"
+        );
+
+        // SAFETY: we enforce in the loop condition that out_pos <= decoded.capacity()
+        unsafe { buffer.set_len(out_pos) };
+    }
+
+    pub fn space_used_bytes(&self) -> usize {
+        self.lengths.len() + self.symbols.len() * size_of::<Symbol>()
+    }
 }
 
 /// A compressor that uses a symbol table to greedily compress strings.
@@ -512,6 +563,71 @@ impl Compressor {
         );
 
         values.set_len(bytes_written as usize);
+    }
+
+    // Similar to `compress_into`, but this function appends the compressed data
+    // to the provided buffer instead of overwriting its contents.
+    pub unsafe fn compress_append(&self, plaintext: &[u8], values: &mut Vec<u8>) {
+        let original_len = values.len();
+        
+        let mut in_ptr = plaintext.as_ptr();
+        let mut out_ptr = values.as_mut_ptr().add(original_len); // Start appending at the end.
+
+        // SAFETY: `end` will point just after the end of the `plaintext` slice.
+        let in_end = unsafe { in_ptr.byte_add(plaintext.len()) };
+        let in_end_sub8 = in_end as usize - 8;
+        // SAFETY: `end` will point just after the end of the `values` allocation.
+        let out_end = unsafe { values.as_mut_ptr().byte_add(values.capacity()) };
+
+        while (in_ptr as usize) <= in_end_sub8 && out_ptr < out_end {
+            // SAFETY: pointer ranges are checked in the loop condition
+            unsafe {
+                // Load a full 8-byte word of data from in_ptr.
+                // SAFETY: caller asserts in_ptr is not null. we may read past end of pointer though.
+                let word: u64 = std::ptr::read_unaligned(in_ptr as *const u64);
+                let (advance_in, advance_out) = self.compress_word(word, out_ptr);
+                in_ptr = in_ptr.byte_add(advance_in);
+                out_ptr = out_ptr.byte_add(advance_out);
+            };
+        }
+
+        let remaining_bytes = unsafe { in_end.byte_offset_from(in_ptr) };
+        assert!(
+            out_ptr < out_end || remaining_bytes == 0,
+            "output buffer sized too small"
+        );
+
+        let remaining_bytes = remaining_bytes as usize;
+
+        // Load the last `remaining_byte`s of data into a final world. We then replicate the loop above,
+        // but shift data out of this word rather than advancing an input pointer and potentially reading
+        // unowned memory.
+        let mut bytes = [0u8; 8];
+        std::ptr::copy_nonoverlapping(in_ptr, bytes.as_mut_ptr(), remaining_bytes);
+        let mut last_word = u64::from_le_bytes(bytes);
+
+        while in_ptr < in_end && out_ptr < out_end {
+            // Load a full 8-byte word of data from in_ptr.
+            // SAFETY: caller asserts in_ptr is not null. we may read past end of pointer though.
+            let (advance_in, advance_out) = self.compress_word(last_word, out_ptr);
+            in_ptr = in_ptr.byte_add(advance_in);
+            out_ptr = out_ptr.byte_add(advance_out);
+
+            last_word = advance_8byte_word(last_word, advance_in);
+        }
+
+        // in_ptr should have exceeded in_end
+        assert!(in_ptr >= in_end, "exhausted output buffer before exhausting input, there is a bug in SymbolTable::compress()");
+
+        // Calculate the total number of bytes written during this call.
+        let bytes_written = out_ptr.offset_from(values.as_ptr().add(original_len)) as usize;
+        assert!(
+            bytes_written >= 0,
+            "out_ptr ended before it started, not possible"
+        );
+
+        // Update the vector length to reflect the new appended data.
+        values.set_len(original_len + bytes_written);
     }
 
     /// Use the symbol table to compress the plaintext into a sequence of codes and escapes.
