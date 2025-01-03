@@ -302,7 +302,9 @@ impl<'a> Decompressor<'a> {
         decoded
     }
 
-    pub fn decompress_into(&self, compressed: &[u8], buffer: &mut Vec<u8>) {
+    /// Decompress a byte slice that was previously returned by a compressor using
+    /// the same symbol table, writing the result into a target buffer.
+    pub fn decompress_into(&self, compressed: &[u8], buffer: &mut [u8]) -> usize {
         let ptr = buffer.as_mut_ptr();
 
         let mut in_pos = 0;
@@ -310,7 +312,7 @@ impl<'a> Decompressor<'a> {
 
         while in_pos < compressed.len() {
             // out_pos can grow at most 8 bytes per iteration, and we start at 0
-            debug_assert!(out_pos <= buffer.capacity() - size_of::<Symbol>());
+            debug_assert!(out_pos <= buffer.len() - size_of::<Symbol>());
             // SAFETY: in_pos is always in range 0..compressed.len()
             let code = unsafe { *compressed.get_unchecked(in_pos) };
             if code == ESCAPE_CODE {
@@ -345,10 +347,10 @@ impl<'a> Decompressor<'a> {
             "decompression should exhaust input before output"
         );
 
-        // SAFETY: we enforce in the loop condition that out_pos <= decoded.capacity()
-        unsafe { buffer.set_len(out_pos) };
+        out_pos
     }
 
+    /// Returns the number of bytes used by the compressor.
     pub fn space_used_bytes(&self) -> usize {
         self.lengths.len() + self.symbols.len() * size_of::<Symbol>()
     }
@@ -565,8 +567,8 @@ impl Compressor {
         values.set_len(bytes_written as usize);
     }
 
-    // Similar to `compress_into`, but this function appends the compressed data
-    // to the provided buffer instead of overwriting its contents.
+    /// Similar to `compress_into`, but this function appends the compressed data
+    /// to the provided buffer instead of overwriting its contents.
     pub unsafe fn compress_append(&self, plaintext: &[u8], values: &mut Vec<u8>) {
         let original_len = values.len();
         
@@ -621,10 +623,6 @@ impl Compressor {
 
         // Calculate the total number of bytes written during this call.
         let bytes_written = out_ptr.offset_from(values.as_ptr().add(original_len)) as usize;
-        assert!(
-            bytes_written >= 0,
-            "out_ptr ended before it started, not possible"
-        );
 
         // Update the vector length to reflect the new appended data.
         values.set_len(original_len + bytes_written);
